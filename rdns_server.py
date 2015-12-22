@@ -9,7 +9,7 @@
 import getopt, os, os.path, sys
 import struct, socket, select, errno, threading
 from binascii import hexlify
-import dns.message, dns.rdatatype, dns.rcode, dns.flags, dns.query
+import dns.message, dns.rdatatype, dns.rcode, dns.flags, dns.query, dns.edns
 
 
 DEBUG      = True
@@ -20,21 +20,30 @@ FORWARDER  = '127.0.0.1'
 
 class Prefs:
     """Preferences"""
-    DEBUG      = True                     # -d: Print debugging output?
+    DEBUG      = False                    # -d: Print debugging output?
     SERVER     = ""                       # -s: server listening address
     PORT       = 53                       # -p: port
     FORWARDER  = '127.0.0.1'              # -f: forwarder DNS server
 
 
 def dprint(input):
-    if DEBUG:
+    if Prefs.DEBUG:
         with tlock:
             print("DEBUG: %s" % input)
 
 
 def usage():
     """Usage string"""
-    print("Usage: %s <port>" % os.path.basename(sys.argv[0]))
+    print("""\
+Usage: %s [<options>]
+
+Options:
+       -h:        Print usage string
+       -d:        Turn on debugging
+       -p N:      Listen on port N
+       -s A:      Bind to server address A
+       -f F:      Use F (IP address) as forwarder
+""" % os.path.basename(sys.argv[0]))
     sys.exit(1)
 
 
@@ -181,6 +190,10 @@ class DNSquery:
                 self.rcode = -1
             else:
                 self.txid = self.query.id
+                if self.query.edns != -1:
+                    for option in self.query.options:
+                        dprint("EDNS option %d: %s" % 
+                               (option.otype, hexlify(option.data)))
 
     def prepend_length(self, msg):
         return struct.pack('!H', len(msg)) + msg
@@ -296,12 +309,14 @@ def process_args(arguments):
     global Prefs
 
     try:
-        (options, args) = getopt.getopt(arguments, 'ds:p:f:')
+        (options, args) = getopt.getopt(arguments, 'hds:p:f:')
     except getopt.GetoptError:
         usage()
 
     for (opt, optval) in options:
-        if opt == "-d":
+        if opt == "-h":
+            usage()
+        elif opt == "-d":
             Prefs.DEBUG = True
         elif opt == "-s":
             Prefs.SERVER = optval
