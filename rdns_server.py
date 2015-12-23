@@ -160,12 +160,14 @@ class Resolver:
 class DNSquery:
     """DNS query and response object"""
     query = None
+    wire_query = None
     response = None
     wire_response = None
+    chainquery = False
     rcode = dns.rcode.NOERROR
-    dontreply = False
 
     def __init__(self, data, tcp=False):
+        self.wire_query = data
         self.tcp = tcp
         if self.tcp:
             msg_len, = struct.unpack('!H', data[:2])
@@ -191,9 +193,35 @@ class DNSquery:
             else:
                 self.txid = self.query.id
                 if self.query.edns != -1:
-                    for option in self.query.options:
-                        dprint("EDNS option %d: %s" % 
-                               (option.otype, hexlify(option.data)))
+                    self.process_edns_opts()
+
+    def wire2name(self, wire):
+        """convert uncompressed wire format name to dns.name.Name object"""
+        if wire == b'\x00':
+            return dns.name.root
+        else:
+            labellist = []
+            offset = 0
+            Done = False
+            while not Done:
+                llen, = struct.unpack('B', wire[offset])
+                if (llen >> 6) == 0x3:
+                    raise ValueError("Invalid label type")
+                else:
+                    offset += 1
+                    label = wire[offset:offset+llen]
+                    offset += llen
+                    labellist.append(label)
+                    if llen == 0:
+                        Done = True
+            return dns.name.Name(labellist)
+
+    def process_edns_opts(self):
+        for option in self.query.options:
+            dprint("EDNS option %d: %s" % (option.otype, hexlify(option.data)))
+            if option.otype == 13:
+                self.chainquery = True
+                self.closest_trustpoint = self.wire2name(option.data)
 
     def prepend_length(self, msg):
         return struct.pack('!H', len(msg)) + msg
