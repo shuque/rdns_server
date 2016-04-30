@@ -6,7 +6,7 @@
     Author: Shumon Huque <shuque@gmail.com>
 """
 
-import getopt, os, os.path, sys
+import getopt, os, os.path, sys, ssl
 import struct, socket, select, errno, threading
 from binascii import hexlify
 import dns.message, dns.rdatatype, dns.rcode, dns.flags, dns.query, dns.edns
@@ -23,7 +23,11 @@ class Prefs:
     DEBUG      = False                    # -d: Print debugging output?
     SERVER     = ""                       # -s: server listening address
     PORT       = 53                       # -p: port
+    TLS        = False                    # -t: listen on TLS port
+    TLS_PORT   = 853                      # -P: tls_port
     FORWARDER  = '127.0.0.1'              # -f: forwarder DNS server
+    KEYFILE    = "cheetara.key"           # TLS private key file (PEM)
+    CRTFILE    = "cheetara.crt"           # TLS certificate file (PEM)
 
 
 def dprint(input):
@@ -40,11 +44,28 @@ Usage: %s [<options>]
 Options:
        -h:        Print usage string
        -d:        Turn on debugging
-       -p N:      Listen on port N
+       -t:        Listen on TLS (in addition to UDP and TCP)
+       -p N:      Listen on port N (default 53)
+       -P N:      Listen for TLS connections on port N (default 853)
        -s A:      Bind to server address A
-       -f F:      Use F (IP address) as forwarder
+       -f F:      Use F (IP address) as forwarder (default 127.0.0.1)
 """ % os.path.basename(sys.argv[0]))
     sys.exit(1)
+
+
+def udp4socket(host, port):
+    """Create IPv4 UDP server socket"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    return sock
+
+
+def udp6socket(host, port):
+    """Create IPv6 UDP server socket"""
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.bind((host, port))
+    return sock
 
 
 def tcp4socket(host, port):
@@ -66,19 +87,42 @@ def tcp6socket(host, port):
     return sock
 
 
-def udp4socket(host, port):
-    """Create IPv4 UDP server socket"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, port))
-    return sock
+def tls4socket(host, port, keyfile, crtfile):
+    """Create IPv4 TCP server socket"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ssl_sock = ssl.wrap_socket(sock, 
+                               keyfile=PREFS.keyfile, certfile=PREFS.crtfile,
+                               server_side=True,
+                               do_handshake_on_connect=True)
+    ssl_sock.bind((host, port))
+    ssl_sock.listen(5)
+    return ssl_sock
 
 
-def udp6socket(host, port):
-    """Create IPv6 UDP server socket"""
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+def tls6socket(host, port, keyfile, crtfile):
+    """Create IPv6 TCP server socket"""
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-    sock.bind((host, port))
-    return sock
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ssl_sock = ssl.wrap_socket(sock,
+                               keyfile=PREFS.keyfile, certfile=PREFS.crtfile,
+                               server_side=True,
+                               do_handshake_on_connect=True)
+    ssl_sock.bind((host, port))
+    ssl_sock.listen(5)
+    return ssl_sock
+
+
+def get_tls_context(keyfile, crtfile):
+    """Create TLS context"""
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.options |= ssl.OP_NO_SSLv2
+    ctx.options |= ssl.OP_NO_SSLv3
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(keyfile=keyfile, certfile=crtfile)
+    return ctx
 
 
 def sendSocket(s, message):
@@ -298,6 +342,22 @@ class DNSquery:
             self.wire_response = wire
 
 
+def handle_connection_udp(sock, rbufsize=2048):
+    data, addr = sock.recvfrom(rbufsize)
+    cliaddr, cliport = addr[0:2]
+    dprint("UDP connection from (%s, %d) msgsize=%d" % 
+           (cliaddr, cliport, len(data)))
+    d = DNSquery(data)
+    d.parse_query()
+    dprint("RECEIVED QUERY: %s" % d.query.question[0])
+    d.make_response()
+    if d.response:
+        dprint("SEND RESPONSE: \n%s" % d.response)
+    if d.wire_response:
+        dprint(hexlify(d.wire_response))
+        sock.sendto(d.wire_response, addr)
+
+
 def handle_connection_tcp(sock, addr, rbufsize=2048):
     cliaddr, cliport = addr[0:2]
     data = sock.recv(rbufsize)
@@ -305,7 +365,7 @@ def handle_connection_tcp(sock, addr, rbufsize=2048):
            (cliaddr, cliport, len(data)))
     d = DNSquery(data, tcp=True)
     d.parse_query()
-    dprint("GOT QUERY: \n%s" % d.query)
+    dprint("RECEIVED QUERY: %s" % d.query.question[0])
     d.make_response()
     if d.response:
         dprint("SEND RESPONSE: \n%s" % d.response)
@@ -315,20 +375,21 @@ def handle_connection_tcp(sock, addr, rbufsize=2048):
     sock.close()
 
 
-def handle_connection_udp(sock, rbufsize=2048):
-    data, addr = sock.recvfrom(rbufsize)
+def handle_connection_tls(sock, addr, rbufsize=2048):
     cliaddr, cliport = addr[0:2]
-    dprint("UDP connection from (%s, %d) msgsize=%d" % 
+    data = sock.recv(rbufsize)
+    dprint("TLS connection from (%s, %d) msgsize=%d" %
            (cliaddr, cliport, len(data)))
-    d = DNSquery(data)
+    d = DNSquery(data, tcp=True)
     d.parse_query()
-    dprint("GOT QUERY: \n%s" % d.query)
+    dprint("RECEIVED QUERY: %s" % d.query.question[0])
     d.make_response()
     if d.response:
         dprint("SEND RESPONSE: \n%s" % d.response)
     if d.wire_response:
         dprint(hexlify(d.wire_response))
-        sock.sendto(d.wire_response, addr)
+        sendSocket(sock, d.wire_response)
+    sock.close()
 
 
 def process_args(arguments):
@@ -337,7 +398,7 @@ def process_args(arguments):
     global Prefs
 
     try:
-        (options, args) = getopt.getopt(arguments, 'hds:p:f:')
+        (options, args) = getopt.getopt(arguments, 'hdts:p:P:f:')
     except getopt.GetoptError:
         usage()
 
@@ -346,10 +407,14 @@ def process_args(arguments):
             usage()
         elif opt == "-d":
             Prefs.DEBUG = True
+        elif opt == "-t":
+            Prefs.TLS = True
         elif opt == "-s":
             Prefs.SERVER = optval
         elif opt == "-p":
             Prefs.PORT = int(optval)
+        elif opt == "-P":
+            Prefs.TLS_PORT = int(optval)
         elif opt == "-f":
             Prefs.FORWARDER = optval
 
@@ -360,14 +425,30 @@ if __name__ == '__main__':
 
     process_args(sys.argv[1:])
 
-    s_tcp4 = tcp4socket(Prefs.SERVER, Prefs.PORT)
-    s_udp4 = udp4socket(Prefs.SERVER, Prefs.PORT)
-    s_tcp6 = tcp6socket(Prefs.SERVER, Prefs.PORT)
-    s_udp6 = udp6socket(Prefs.SERVER, Prefs.PORT)
-    print("Listening on port %d" % Prefs.PORT)
+    tls_ctx = get_tls_context(Prefs.KEYFILE, Prefs.CRTFILE)
 
-    fd_read = [ s_tcp4.fileno(), s_udp4.fileno(), s_tcp6.fileno(), \
-                s_udp6.fileno()]
+    s_udp4 = udp4socket(Prefs.SERVER, Prefs.PORT)
+    s_tcp4 = tcp4socket(Prefs.SERVER, Prefs.PORT)
+
+    s_udp6 = udp6socket(Prefs.SERVER, Prefs.PORT)
+    s_tcp6 = tcp6socket(Prefs.SERVER, Prefs.PORT)
+
+    fd_read = [
+        s_udp4.fileno(),
+        s_tcp4.fileno(),
+        s_udp6.fileno(),
+        s_tcp6.fileno(),
+        ]
+
+    if Prefs.TLS:
+        s_tls4 = tcp4socket(Prefs.SERVER, Prefs.TLS_PORT)
+        s_tls6 = tcp6socket(Prefs.SERVER, Prefs.TLS_PORT)
+        fd_read.extend([s_tls4.fileno(), s_tls6.fileno()])
+
+    print("Listening on UDP and TCP port %d%s" % 
+          (Prefs.PORT,
+           " and TLS port {}".format(Prefs.TLS_PORT) if Prefs.TLS else ""))
+
     tlock = threading.Lock()
 
     while True:
@@ -380,6 +461,9 @@ if __name__ == '__main__':
             else:
                 print("Fatal error from select(): %s" % e)
                 sys.exit(1)
+        except KeyboardInterrupt:
+            print("Exiting.");
+            os._exit(0)
 
         if ready_r:
             for fd in ready_r:
@@ -390,13 +474,23 @@ if __name__ == '__main__':
                 elif fd == s_udp4.fileno():
                     threading.Thread(target=handle_connection_udp, 
                                      args=(s_udp4,)).start()
-                if fd == s_tcp6.fileno():
+                elif fd == s_tcp6.fileno():
                     s_conn6, addr = s_tcp6.accept()
                     threading.Thread(target=handle_connection_tcp, 
                                      args=(s_conn6, addr)).start()
                 elif fd == s_udp6.fileno():
                     threading.Thread(target=handle_connection_udp, 
                                      args=(s_udp6,)).start()
+                elif Prefs.TLS and fd == s_tls4.fileno():
+                    s_conn4, addr = s_tls4.accept()
+                    tlsconn = tls_ctx.wrap_socket(s_conn4, server_side=True)
+                    threading.Thread(target=handle_connection_tls, 
+                                     args=(tlsconn, addr)).start()
+                elif Prefs.TLS and fd == s_tls6.fileno():
+                    s_conn6, addr = s_tls6.accept()
+                    tlsconn = tls_ctx.wrap_socket(s_conn6, server_side=True)
+                    threading.Thread(target=handle_connection_tls, 
+                                     args=(tlsconn, addr)).start()
 
         # Do something in the main thread here if needed
         #dprint("Heartbeat.")
